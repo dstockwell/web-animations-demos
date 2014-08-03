@@ -409,7 +409,6 @@ var AnimationPlayer = function(token, source, timeline) {
     this._hasTicked = false;
 
     this.source = source;
-    this._checkForLegacyHandlers();
     this._lastCurrentTime = undefined;
     this._finishedFlag = false;
     initializeEventTarget(this);
@@ -437,7 +436,6 @@ AnimationPlayer.prototype = {
         this._update();
         maybeRestartAnimation();
       }
-      this._checkForLegacyHandlers();
     } finally {
       exitModifyCurrentAnimationState(repeatLastTick);
     }
@@ -691,25 +689,7 @@ AnimationPlayer.prototype = {
       this._lastCurrentTime = 0;
     }
 
-    if (this._needsLegacyHandlerPass) {
-      var timeDelta = this._unlimitedCurrentTime - this._lastCurrentTime;
-      if (timeDelta > 0) {
-        this.source._generateLegacyEvents(
-            this._lastCurrentTime, this._unlimitedCurrentTime,
-            this.timeline.currentTime, 1);
-      }
-    }
-
     this._lastCurrentTime = this._unlimitedCurrentTime;
-  },
-  // These two legacy methods are for deprecated TimedItem event handling and
-  // should be removed once we stop supporting it.
-  _legacyHandlerAdded: function() {
-    this._needsLegacyHandlerPass = true;
-  },
-  _checkForLegacyHandlers: function() {
-    this._needsLegacyHandlerPass = this.source !== null &&
-        this.source._hasLegacyEventHandlers();
   },
   _registerOnTimeline: function() {
     if (!this._registeredOnTimeline) {
@@ -957,6 +937,10 @@ TimedItem.prototype = {
         this._modulusWithClosedOpenRange(
             adjustedAnimationTime, this.duration);
     this._iterationTime = this._scaleIterationTime(unscaledIterationTime);
+    if (this.duration == Infinity) {
+      this._timeFraction = 0;
+      return;
+    }
     this._timeFraction = this._iterationTime / this.duration;
     ASSERT_ENABLED && assert(
         this._timeFraction >= 0.0 && this._timeFraction <= 1.0,
@@ -1092,13 +1076,6 @@ TimedItem.prototype = {
   _hasFutureEffect: function() {
     return this._isCurrent() || this._fill !== 'none';
   },
-  _hasLegacyEventHandlers: function() {
-    return hasEventHandlersForEvent(this, 'start') ||
-        hasEventHandlersForEvent(this, 'iteration') ||
-        hasEventHandlersForEvent(this, 'end') ||
-        hasEventHandlersForEvent(this, 'cancel');
-  },
-  _generateChildLegacyEventsForRange: function() { },
   _toSubRanges: function(fromTime, toTime, iterationTimes) {
     if (fromTime > toTime) {
       var revRanges = this._toSubRanges(toTime, fromTime, iterationTimes);
@@ -1127,159 +1104,8 @@ TimedItem.prototype = {
     }
     ranges.push([currentStart, toTime]);
     return {start: skipped, delta: 1, ranges: ranges};
-  },
-  _generateLegacyEvents: function(fromTime, toTime, globalTime, deltaScale) {
-    function toGlobal(time) {
-      return (globalTime - (toTime - (time / deltaScale)));
-    }
-    var firstIteration = Math.floor(this.timing.iterationStart);
-    var lastIteration = Math.floor(this.timing.iterationStart +
-        this.timing.iterations);
-    if (lastIteration === this.timing.iterationStart +
-        this.timing.iterations) {
-      lastIteration -= 1;
-    }
-    var startTime = this.startTime + this.timing.delay;
-
-    if (hasEventHandlersForEvent(this, 'start')) {
-      // Did we pass the start of this animation in the forward direction?
-      if (fromTime <= startTime && toTime > startTime) {
-        callEventHandlers(this, 'start',
-            new TimingEvent(
-                constructorToken, this, 'start', this.timing.delay,
-                toGlobal(startTime), firstIteration));
-      // Did we pass the end of this animation in the reverse direction?
-      } else if (fromTime > this.endTime && toTime <= this.endTime) {
-        callEventHandlers(this, 'start',
-            new TimingEvent(
-                constructorToken, this, 'start', this.endTime - this.startTime,
-                toGlobal(this.endTime), lastIteration));
-      }
-    }
-
-    // Calculate a list of uneased iteration times.
-    var iterationTimes = [];
-    for (var i = firstIteration + 1; i <= lastIteration; i++) {
-      iterationTimes.push(i - this.timing.iterationStart);
-    }
-    iterationTimes = iterationTimes.map(function(i) {
-      return i * this.duration / this.timing.playbackRate + startTime;
-    }.bind(this));
-
-    // Determine the impacted subranges.
-    var clippedFromTime;
-    var clippedToTime;
-    if (fromTime < toTime) {
-      clippedFromTime = Math.max(fromTime, startTime);
-      clippedToTime = Math.min(toTime, this.endTime);
-    } else {
-      clippedFromTime = Math.min(fromTime, this.endTime);
-      clippedToTime = Math.max(toTime, startTime);
-    }
-    var subranges = this._toSubRanges(
-        clippedFromTime, clippedToTime, iterationTimes);
-
-    for (var i = 0; i < subranges.ranges.length; i++) {
-      var currentIter = subranges.start + i * subranges.delta;
-      if (i > 0 && hasEventHandlersForEvent(this, 'iteration')) {
-        var iterTime = subranges.ranges[i][0];
-        callEventHandlers(this, 'iteration',
-            new TimingEvent(
-                constructorToken, this, 'iteration', iterTime - this.startTime,
-                toGlobal(iterTime), currentIter));
-      }
-
-      var iterFraction;
-      if (subranges.delta > 0) {
-        iterFraction = this.timing.iterationStart % 1;
-      } else {
-        iterFraction = 1 -
-            (this.timing.iterationStart + this.timing.iterations) % 1;
-      }
-      this._generateChildLegacyEventsForRange(
-          subranges.ranges[i][0], subranges.ranges[i][1],
-          fromTime, toTime, currentIter - iterFraction,
-          globalTime, deltaScale * this.timing.playbackRate);
-    }
-
-    if (hasEventHandlersForEvent(this, 'end')) {
-      // Did we pass the end of this animation in the forward direction?
-      if (fromTime < this.endTime && toTime >= this.endTime) {
-        callEventHandlers(this, 'end',
-            new TimingEvent(
-                constructorToken, this, 'end', this.endTime - this.startTime,
-                toGlobal(this.endTime), lastIteration));
-      // Did we pass the start of this animation in the reverse direction?
-      } else if (fromTime >= startTime && toTime < startTime) {
-        callEventHandlers(this, 'end',
-            new TimingEvent(
-                constructorToken, this, 'end', this.timing.delay,
-                toGlobal(startTime), firstIteration));
-      }
-    }
-  },
-  localTimeToTimeFraction: function(localTime) {
-    var oldInheritedTime = this._inheritedTime;
-    this._inheritedTime = localTime + this._startTime;
-    this._updateTimeMarkers();
-    var newTimeFraction = this._timeFraction;
-    this._inheritedTime = oldInheritedTime;
-    this._updateTimeMarkers();
-    return newTimeFraction;
   }
 };
-
-defineDeprecatedProperty(TimedItem.prototype, 'specified', function() {
-  deprecated('specified', '2014-04-16', 'Please use timing instead.');
-  return this.timing;
-});
-var deprecatedTimedItemEvents = function() {
-  deprecated('TimedItem events', '2014-04-22',
-      'Please use the AnimationPlayer finish event instead.', true);
-};
-['start', 'iteration', 'end', 'cancel'].forEach(function(eventName) {
-  defineDeprecatedProperty(TimedItem.prototype, 'on' + eventName,
-      function() {
-        deprecatedTimedItemEvents();
-        return getOnEventHandler(this, eventName);
-      },
-      function(handler) {
-        deprecatedTimedItemEvents();
-        setOnEventHandler(this, eventName, handler);
-        if (this.player) {
-          if (typeof func === 'function') {
-            this.player._legacyHandlerAdded();
-          } else {
-            this.player._checkForLegacyHandlers();
-          }
-        }
-      });
-});
-defineDeprecatedProperty(TimedItem.prototype, 'addEventListener', function() {
-  deprecatedTimedItemEvents();
-  return function(type, handler) {
-    if (type !== 'start' &&
-        type !== 'iteration' &&
-        type !== 'end' &&
-        type !== 'cancel') {
-      return;
-    }
-    addEventHandler(this, type, handler);
-    if (this.player) {
-      this.player._legacyHandlerAdded();
-    }
-  }
-});
-defineDeprecatedProperty(TimedItem.prototype, 'removeEventListener',
-    function() {
-      deprecatedTimedItemEvents();
-      return function(type, handler) {
-        removeEventHandler(this, type, handler);
-        if (this.player) {
-          this.player._checkForLegacyHandlers();
-        }
-      }
-    });
 
 var TimingEvent = function(
     token, target, type, localTime, timelineTime, iterationIndex, seeked) {
@@ -1336,7 +1162,6 @@ var Animation = function(target, animationEffect, timingInput) {
   } finally {
     exitModifyCurrentAnimationState(null);
   }
-  this._previousTimeFraction = null;
 };
 
 Animation.prototype = createObject(TimedItem.prototype, {
@@ -1347,8 +1172,7 @@ Animation.prototype = createObject(TimedItem.prototype, {
     if (isDefinedAndNotNull(this.effect) &&
         !(this.target instanceof PseudoElementReference)) {
       if (isEffectCallback(this.effect)) {
-        this.effect(this._timeFraction, this, this._previousTimeFraction);
-        this._previousTimeFraction = this._timeFraction;
+        this.effect(this._timeFraction, this.target, this);
       } else {
         this.effect._sample(this._timeFraction, this.currentIteration,
             this.target, this.underlyingValue);
@@ -1395,10 +1219,6 @@ Animation.prototype = createObject(TimedItem.prototype, {
     }
     return 'Animation ' + this.startTime + '-' + this.endTime + ' (' +
         this.localTime + ') ' + effectString;
-  },
-  effectValueAtLocalTime: function(localTime) {
-    return this.effect.valueAtTimeFraction(
-        this.localTimeToTimeFraction(localTime));
   }
 });
 
@@ -1486,10 +1306,6 @@ TimingGroup.prototype = createObject(TimedItem.prototype, {
 
     // Update child start times before walking down.
     this._updateChildStartTimes();
-
-    if (this.player) {
-      this.player._checkForLegacyHandlers();
-    }
 
     this._isInChildrenStateModified = false;
   },
@@ -1641,41 +1457,6 @@ TimingGroup.prototype = createObject(TimedItem.prototype, {
     return this.type + ' ' + this.startTime + '-' + this.endTime + ' (' +
         this.localTime + ') ' + ' [' +
         this._children.map(function(a) { return a.toString(); }) + ']';
-  },
-  _hasLegacyEventHandlers: function() {
-    return TimedItem.prototype._hasLegacyEventHandlers.call(this) || (
-        this._children.length > 0 &&
-        this._children.reduce(
-            function(a, b) { return a || b._hasLegacyEventHandlers(); },
-            false));
-  },
-  _generateChildLegacyEventsForRange: function(localStart, localEnd, rangeStart,
-      rangeEnd, iteration, globalTime, deltaScale) {
-    var start;
-    var end;
-
-    if (localEnd - localStart > 0) {
-      start = Math.max(rangeStart, localStart);
-      end = Math.min(rangeEnd, localEnd);
-      if (start >= end) {
-        return;
-      }
-    } else {
-      start = Math.min(rangeStart, localStart);
-      end = Math.max(rangeEnd, localEnd);
-      if (start <= end) {
-        return;
-      }
-    }
-
-    var endDelta = rangeEnd - end;
-    start -= iteration * this.duration / deltaScale;
-    end -= iteration * this.duration / deltaScale;
-
-    for (var i = 0; i < this._children.length; i++) {
-      this._children[i]._generateLegacyEvents(
-          start, end, globalTime - endDelta, deltaScale);
-    }
   }
 });
 
@@ -1871,72 +1652,18 @@ MediaReference.prototype = createObject(TimedItem.prototype, {
 });
 
 
-function toUsableValue(property, value) {
-  if (!value.dependsOnUnderlyingValue()) {
-    var result = getType(property).toCssValue(value.compositeOnto(property, undefined));
-    return function() { return result; };
-  } else {
-    return function(underlying) {
-      if (underlying == undefined) {
-        throw new TypeError('Underlying value undefined');
-      }
-      var propertyType = getType(property);
-      var internalUnderlying = propertyType.fromCssValue(underlying);
-      return propertyType.toCssValue(value.compositeOnto(property,
-          internalUnderlying));
-    }
-  }
-}
-
-function toUsableValues(dict) {
-  var result = {};
-  for (var property in dict) {
-    result[property] = toUsableValue(property, dict[property]);
-  }
-  return result;
-}
 
 /** @constructor */
-var AnimationEffect = function(token, accumulate) {
+var AnimationEffect = function(token) {
   if (token !== constructorToken) {
     throw new TypeError('Illegal constructor');
-  }
-  enterModifyCurrentAnimationState();
-  try {
-    this.accumulate = accumulate;
-  } finally {
-    exitModifyCurrentAnimationState(null);
   }
 };
 
 AnimationEffect.prototype = {
-  get accumulate() {
-    return this._accumulate;
-  },
-  set accumulate(value) {
-    enterModifyCurrentAnimationState();
-    try {
-      // Use the default value if an invalid string is specified.
-      this._accumulate = value === 'sum' ? 'sum' : 'none';
-    } finally {
-      exitModifyCurrentAnimationState(repeatLastTick);
-    }
-  },
-  _sample: function(timeFraction, currentIteration, target) {
-    var sample = this._generateSample(timeFraction, currentIteration);
-    for (var property in sample) {
-      compositor.setAnimatedValue(target, property, sample[property]);
-    }
-  },
-  _generateSample: abstractMethod,
+  _sample: abstractMethod,
   clone: abstractMethod,
-  toString: abstractMethod,
-  valueAtTimeFraction: function(timeFraction, currentIteration) {
-    if (currentIteration === undefined) {
-      currentIteration = 0;
-    }
-    return toUsableValues(this._generateSample(timeFraction, currentIteration));
-  }
+  toString: abstractMethod
 };
 
 var clamp = function(x, min, max) {
@@ -1946,18 +1673,31 @@ var clamp = function(x, min, max) {
 
 
 /** @constructor */
-var MotionPathEffect = function(path, autoRotate, preTransform, composite,
-    accumulate) {
+var MotionPathEffect = function(path, autoRotate, angle, composite) {
+  var iterationComposite = undefined;
+  var options = autoRotate;
+  if (typeof options == 'string' || options instanceof String ||
+      angle || composite) {
+    // FIXME: add deprecation warning - please pass an options dictionary to
+    // MotionPathEffect constructor
+  } else if (options) {
+    autoRotate = options.autoRotate;
+    angle = options.angle;
+    composite = options.composite;
+    iterationComposite = options.iterationComposite;
+  }
+
   enterModifyCurrentAnimationState();
   try {
-    AnimationEffect.call(this, constructorToken, accumulate);
+    AnimationEffect.call(this, constructorToken);
 
     this.composite = composite;
+    this.iterationComposite = iterationComposite;
 
     // TODO: path argument is not in the spec -- seems useful since
     // SVGPathSegList doesn't have a constructor.
     this.autoRotate = isDefined(autoRotate) ? autoRotate : 'none';
-    this.preTransform = isDefined(preTransform) ? transformType.fromCssValue(preTransform) : [];
+    this.angle = isDefined(angle) ? angle : 0;
     this._path = document.createElementNS(SVG_NS, 'path');
     if (path instanceof SVGPathSegList) {
       this.segments = path;
@@ -1984,22 +1724,44 @@ MotionPathEffect.prototype = createObject(AnimationEffect.prototype, {
       exitModifyCurrentAnimationState(repeatLastTick);
     }
   },
-  _generateSample: function(timeFraction, currentIteration) {
+  get iterationComposite() {
+    return this._iterationComposite;
+  },
+  set iterationComposite(value) {
+    enterModifyCurrentAnimationState();
+    try {
+      // Use the default value if an invalid string is specified.
+      this._iterationComposite =
+          value === 'accumulate' ? 'accumulate' : 'replace';
+      this._updateOffsetPerIteration();
+    } finally {
+      exitModifyCurrentAnimationState(repeatLastTick);
+    }
+  },
+  _sample: function(timeFraction, currentIteration, target) {
     // TODO: Handle accumulation.
     var lengthAtTimeFraction = this._lengthAtTimeFraction(timeFraction);
     var point = this._path.getPointAtLength(lengthAtTimeFraction);
-    var value = [{t: 'translate', d: [{px: point.x}, {px: point.y}]}];
+    var x = point.x - target.offsetWidth / 2;
+    var y = point.y - target.offsetHeight / 2;
+    if (currentIteration !== 0 && this._offsetPerIteration) {
+      x += this._offsetPerIteration.x * currentIteration;
+      y += this._offsetPerIteration.y * currentIteration;
+    }
+    // TODO: calc(point.x - 50%) doesn't work?
+    var value = [{t: 'translate', d: [{px: x}, {px: y}]}];
+    var angle = this.angle;
     if (this._autoRotate === 'auto-rotate') {
       // Super hacks
       var lastPoint = this._path.getPointAtLength(lengthAtTimeFraction - 0.01);
       var dx = point.x - lastPoint.x;
       var dy = point.y - lastPoint.y;
       var rotation = Math.atan2(dy, dx);
-      var angle = rotation / 2 / Math.PI * 360;
+      angle += rotation / 2 / Math.PI * 360;
     }
-    value = value.concat(this.preTransform);
     value.push({t: 'rotate', d: [angle]});
-    return {transform: new AddReplaceCompositableValue(value, this.composite)};
+    compositor.setAnimatedValue(target, 'transform',
+        new AddReplaceCompositableValue(value, this.composite));
   },
   _lengthAtTimeFraction: function(timeFraction) {
     var segmentCount = this._cumulativeLengths.length - 1;
@@ -2010,6 +1772,16 @@ MotionPathEffect.prototype = createObject(AnimationEffect.prototype, {
     var index = clamp(Math.floor(scaledFraction), 0, segmentCount);
     return this._cumulativeLengths[index] + ((scaledFraction % 1) * (
         this._cumulativeLengths[index + 1] - this._cumulativeLengths[index]));
+  },
+  _updateOffsetPerIteration: function() {
+    if (this.iterationComposite === 'accumulate' &&
+        this._cumulativeLengths &&
+        this._cumulativeLengths.length > 0) {
+      this._offsetPerIteration = this._path.getPointAtLength(
+          this._cumulativeLengths[this._cumulativeLengths.length - 1]);
+    } else {
+      this._offsetPerIteration = null;
+    }
   },
   clone: function() {
     return new MotionPathEffect(this._path.getAttribute('d'));
@@ -2059,6 +1831,7 @@ MotionPathEffect.prototype = createObject(AnimationEffect.prototype, {
         }
       }
       this._cumulativeLengths = cumulativeLengths;
+      this._updateOffsetPerIteration();
     } finally {
       exitModifyCurrentAnimationState(repeatLastTick);
     }
@@ -2218,10 +1991,10 @@ var normalizeKeyframeDictionary = function(properties) {
 
 /** @constructor */
 var KeyframeEffect = function(oneOrMoreKeyframeDictionaries,
-    composite, accumulate) {
+    composite) {
   enterModifyCurrentAnimationState();
   try {
-    AnimationEffect.call(this, constructorToken, accumulate);
+    AnimationEffect.call(this, constructorToken);
 
     this.composite = composite;
 
@@ -2261,58 +2034,15 @@ KeyframeEffect.prototype = createObject(AnimationEffect.prototype, {
       exitModifyCurrentAnimationState(repeatLastTick);
     }
   },
-  _generateSample: function(timeFraction, currentIteration) {
-    var returnValue = {};
-    var frames= this._propertySpecificKeyframes();
+  _sample: function(timeFraction, currentIteration, target) {
+    var frames = this._propertySpecificKeyframes();
     for (var property in frames) {
-      returnValue[property] = this._sampleForProperty(frames[property], timeFraction, currentIteration);
+      compositor.setAnimatedValue(target, property,
+          this._sampleForProperty(
+              frames[property], timeFraction, currentIteration));
     }
-    return returnValue;
-  }, 
+  },
   _sampleForProperty: function(frames, timeFraction, currentIteration) {
-    var unaccumulatedValue = this._getUnaccumulatedValue(frames, timeFraction);
-
-    // We can only accumulate if this iteration is strictly positive and if all
-    // keyframes use the same composite operation.
-    if (this.accumulate === 'sum' &&
-        currentIteration > 0 &&
-        this._allKeyframesUseSameCompositeOperation(frames)) {
-      // TODO: The spec is vague about the order of addition here when using add
-      // composition.
-      return new AccumulatedCompositableValue(unaccumulatedValue,
-          this._getAccumulatingValue(frames), currentIteration);
-    }
-
-    return unaccumulatedValue;
-  },
-  _getAccumulatingValue: function(frames) {
-    ASSERT_ENABLED && assert(
-        this._allKeyframesUseSameCompositeOperation(frames),
-        'Accumulation only valid if all frames use same composite operation');
-
-    // This is a BlendedCompositableValue, though because the offset is 1.0, we
-    // could simplify it to an AddReplaceCompositableValue representing the
-    // keyframe at offset 1.0. We don't do this because the spec is likely to
-    // change such that there is no guarantee that a keyframe with offset 1.0 is
-    // present.
-    // TODO: Consider caching this.
-    var unaccumulatedValueAtOffsetOne = this._getUnaccumulatedValue(
-        frames, 1.0);
-
-    if (this._compositeForKeyframe(frames[0]) === 'add') {
-      return unaccumulatedValueAtOffsetOne;
-    }
-
-    // For replace composition, we must evaluate the BlendedCompositableValue
-    // to get a concrete value (note that the choice of underlying value is
-    // irrelevant since it uses replace composition). We then form a new
-    // AddReplaceCompositable value to add-composite this concrete value.
-    ASSERT_ENABLED && assert(
-        !unaccumulatedValueAtOffsetOne.dependsOnUnderlyingValue());
-    return new AddReplaceCompositableValue(
-        unaccumulatedValueAtOffsetOne.compositeOnto(null, null), 'add');
-  },
-  _getUnaccumulatedValue: function(frames, timeFraction) {
     ASSERT_ENABLED && assert(
         frames.length >= 2,
         'Interpolation requires at least two keyframes');
@@ -2411,8 +2141,7 @@ KeyframeEffect.prototype = createObject(AnimationEffect.prototype, {
     return this._cachedPropertySpecificKeyframes;
   },
   clone: function() {
-    var result = new KeyframeEffect([], this.composite,
-        this.accumulate);
+    var result = new KeyframeEffect([], this.composite);
     result._keyframeDictionaries = this._keyframeDictionaries.slice(0);
     return result;
   },
@@ -2491,7 +2220,8 @@ KeyframeEffect.prototype = createObject(AnimationEffect.prototype, {
     if (length > 1 && !isDefinedAndNotNull(distributedKeyframes[0].offset)) {
       distributedKeyframes[0].offset = 0;
     }
-    if (!isDefinedAndNotNull(distributedKeyframes[length - 1].offset)) {
+    if (length > 0 &&
+        !isDefinedAndNotNull(distributedKeyframes[length - 1].offset)) {
       distributedKeyframes[length - 1].offset = 1;
     }
     var lastOffsetIndex = 0;
@@ -4676,6 +4406,11 @@ var propertyTypes = {
   clip: typeWithKeywords(['auto'], rectangleType),
   color: colorType,
   cx: lengthType,
+  cy: lengthType,
+  dx: lengthType,
+  dy: lengthType,
+  fill: colorType,
+  floodColor: colorType,
 
   // TODO: Handle these keywords properly.
   fontSize: typeWithKeywords(['smaller', 'larger'], percentLengthType),
@@ -4684,6 +4419,7 @@ var propertyTypes = {
   height: percentLengthAutoType,
   left: percentLengthAutoType,
   letterSpacing: typeWithKeywords(['normal'], lengthType),
+  lightingColor: colorType,
   lineHeight: percentLengthType, // TODO: Should support numberType as well.
   marginBottom: lengthAutoType,
   marginLeft: lengthAutoType,
@@ -4711,7 +4447,10 @@ var propertyTypes = {
   paddingTop: lengthType,
   perspective: typeWithKeywords(['none'], lengthType),
   perspectiveOrigin: originType,
+  r: lengthType,
   right: percentLengthAutoType,
+  stopColor: colorType,
+  stroke: colorType,
   textIndent: typeWithKeywords(['each-line', 'hanging'], percentLengthType),
   textShadow: shadowType,
   top: percentLengthAutoType,
@@ -4745,6 +4484,16 @@ var propertyTypes = {
 
 var svgProperties = {
   'cx': 1,
+  'cy': 1,
+  'dx': 1,
+  'dy': 1,
+  'fill': 1,
+  'floodColor': 1,
+  'height': 1,
+  'lightingColor': 1,
+  'r': 1,
+  'stopColor': 1,
+  'stroke': 1,
   'width': 1,
   'x': 1,
   'y': 1
@@ -4990,37 +4739,6 @@ BlendedCompositableValue.prototype = createObject(
         }
       }
     });
-
-
-
-/** @constructor */
-var AccumulatedCompositableValue = function(
-    bottomValue, accumulatingValue, accumulationCount) {
-  this.bottomValue = bottomValue;
-  this.accumulatingValue = accumulatingValue;
-  this.accumulationCount = accumulationCount;
-  ASSERT_ENABLED && assert(this.accumulationCount > 0,
-      'Accumumlation count should be strictly positive');
-};
-
-AccumulatedCompositableValue.prototype = createObject(
-    CompositableValue.prototype, {
-      compositeOnto: function(property, underlyingValue) {
-        // The spec defines accumulation recursively, but we do it iteratively
-        // to better handle large numbers of iterations.
-        var result = this.bottomValue.compositeOnto(property, underlyingValue);
-        for (var i = 0; i < this.accumulationCount; i++) {
-          result = this.accumulatingValue.compositeOnto(property, result);
-        }
-        return result;
-      },
-      dependsOnUnderlyingValue: function() {
-        return this.bottomValue.dependsOnUnderlyingValue() &&
-            this.accumulatingValue.dependsOnUnderlyingValue();
-      }
-    });
-
-
 
 /** @constructor */
 var CompositedPropertyMap = function(target) {
@@ -5727,13 +5445,8 @@ window._WebAnimationsTestingUtilities = {
   _types: propertyTypes,
   _knownPlayers: PLAYERS,
   _pacedTimingFunction: PacedTimingFunction,
-  _prefixProperty: prefixProperty
+  _prefixProperty: prefixProperty,
+  _propertyIsSVGAttrib: propertyIsSVGAttrib
 };
-
-defineDeprecatedProperty(window, 'Timeline', function() {
-  deprecated('Timeline', '2014-04-08',
-      'Please use AnimationTimeline instead.');
-  return AnimationTimeline;
-});
 
 })();
